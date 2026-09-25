@@ -1,34 +1,44 @@
 #!/bin/sh
 # dayrec: record audio in the background, all day, to plain WAV files.
 #
-#   dayrec start      start recording in the background
-#   dayrec stop       stop recording (files are finalized cleanly)
-#   dayrec status     show whether it is running and where files go
-#   dayrec run        record in the foreground (for systemd, launchd, cron)
-#   dayrec devices    list audio input devices
-#   dayrec prune      delete day folders older than DAYREC_KEEP_DAYS
+#   dayrec start             start recording in the background
+#   dayrec stop              stop recording (files are finalized cleanly)
+#   dayrec status            show whether it is running and where files go
+#   dayrec run               record in the foreground (for systemd, launchd, cron)
+#   dayrec devices           list audio input devices
+#   dayrec transcribe [X]    transcribe a WAV, a day folder, or today (needs whisper-cli)
+#   dayrec prune             delete day folders older than DAYREC_KEEP_DAYS
 #
 # Files land in one folder per day, one WAV per chunk:
 #   ~/Recordings/dayrec/2026-09-25/14-00-00.wav
 #
 # Settings (environment variables, all optional):
-#   DAYREC_DIR        output folder            (default ~/Recordings/dayrec)
-#   DAYREC_RATE       sample rate in Hz        (default 16000)
-#   DAYREC_CHANNELS   1 = mono, 2 = stereo     (default 1)
-#   DAYREC_CHUNK      seconds per WAV file     (default 3600)
-#   DAYREC_DEVICE     input device             (default: system default mic)
-#   DAYREC_FORMAT     ffmpeg input format      (default: auto; pulse, alsa or avfoundation)
-#   DAYREC_KEEP_DAYS  days kept by "prune"     (default 30)
+#   DAYREC_DIR            output folder            (default ~/Recordings/dayrec)
+#   DAYREC_SOURCE         mic | system | both      (default mic)
+#                         mic: the microphone only. system: what you hear (calls, videos).
+#                         both: mic on the left channel, what you hear on the right.
+#   DAYREC_RATE           sample rate in Hz        (default 16000)
+#   DAYREC_CHUNK          seconds per WAV file     (default 3600)
+#   DAYREC_DEVICE         mic device               (default: system default mic)
+#   DAYREC_SYSTEM_DEVICE  "what you hear" device   (default: monitor of the default output;
+#                         on macOS set this to a virtual device such as BlackHole)
+#   DAYREC_FORMAT         ffmpeg input format      (default: auto; pulse, alsa or avfoundation)
+#   DAYREC_KEEP_DAYS      days kept by "prune"     (default 30)
+#   DAYREC_WHISPER_MODEL  whisper.cpp model file   (default ~/.cache/whisper/ggml-base.en.bin)
+#   DAYREC_LANG           transcription language   (default en)
 #
-# Needs only ffmpeg. 16 kHz mono 16-bit is about 115 MB per hour, 2.7 GB per day.
+# Needs only ffmpeg. 16 kHz mono 16-bit is about 115 MB per hour, 2.7 GB per day;
+# "both" is stereo, so twice that.
 
 set -u
 
 DIR=${DAYREC_DIR:-"$HOME/Recordings/dayrec"}
+SOURCE=${DAYREC_SOURCE:-mic}
 RATE=${DAYREC_RATE:-16000}
-CHANNELS=${DAYREC_CHANNELS:-1}
 CHUNK=${DAYREC_CHUNK:-3600}
 KEEP_DAYS=${DAYREC_KEEP_DAYS:-30}
+MODEL=${DAYREC_WHISPER_MODEL:-"$HOME/.cache/whisper/ggml-base.en.bin"}
+LANG_=${DAYREC_LANG:-en}
 PIDFILE="$DIR/.dayrec.pid"
 LOGFILE="$DIR/.dayrec.log"
 
@@ -36,9 +46,12 @@ die() { echo "dayrec: $*" >&2; exit 1; }
 
 command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg not found in PATH"
 
+case $SOURCE in mic|system|both) ;; *) die "DAYREC_SOURCE must be mic, system or both" ;; esac
+
 detect_input() {
     FMT=${DAYREC_FORMAT:-}
     DEV=${DAYREC_DEVICE:-}
+    SYSDEV=${DAYREC_SYSTEM_DEVICE:-}
     if [ -z "$FMT" ]; then
         case $(uname -s) in
             Darwin) FMT=avfoundation ;;
@@ -57,6 +70,14 @@ detect_input() {
             *) DEV=default ;;
         esac
     fi
+    if [ -z "$SYSDEV" ] && [ "$SOURCE" != mic ]; then
+        case $FMT in
+            # Follows whatever output is current, so switching to headphones just works.
+            pulse) SYSDEV="@DEFAULT_MONITOR@" ;;
+            avfoundation) die "set DAYREC_SYSTEM_DEVICE to a loopback device (e.g. \":BlackHole 2ch\"); macOS cannot capture output directly" ;;
+            *) die "DAYREC_SOURCE=$SOURCE needs PulseAudio/PipeWire, or set DAYREC_SYSTEM_DEVICE to an ALSA loopback" ;;
+        esac
+    fi
 }
 
 is_running() {
@@ -70,22 +91,42 @@ secs_to_midnight() {
     echo $((86400 - h * 3600 - m * 60 - s))
 }
 
+# Runs one ffmpeg until midnight (or until killed). Input wiring depends on SOURCE.
+run_ffmpeg() {
+    left=$1; out=$2
+    case $SOURCE in
+        mic)
+            set -- -f "$FMT" -i "$DEV" -ac 1 ;;
+        system)
+            set -- -f "$FMT" -i "$SYSDEV" -ac 1 ;;
+        both)
+            # Two live inputs; each is downmixed to mono, resampled to a common clock,
+            # then joined as left = mic, right = what you hear.
+            set -- -f "$FMT" -i "$DEV" -f "$FMT" -i "$SYSDEV" \
+                -filter_complex "[0:a]aformat=channel_layouts=mono,aresample=async=1000[m];[1:a]aformat=channel_layouts=mono,aresample=async=1000[s];[m][s]join=inputs=2:channel_layout=stereo[o]" \
+                -map "[o]" ;;
+    esac
+    # exec: this runs in a backgrounded subshell, and the loop must be able to signal ffmpeg itself.
+    exec ffmpeg -nostdin -hide_banner -loglevel error "$@" \
+        -t "$left" -ar "$RATE" -c:a pcm_s16le \
+        -f segment -segment_time "$CHUNK" -segment_atclocktime 1 \
+        -reset_timestamps 1 -strftime 1 -segment_format wav "$out"
+}
+
 record_loop() {
     detect_input
     child=
     trap 'stopping=1; [ -n "$child" ] && kill -TERM "$child" 2>/dev/null' INT TERM
     stopping=0
-    echo "$(date '+%F %T') recording from $FMT:$DEV at ${RATE} Hz x$CHANNELS"
+    case $SOURCE in
+        mic) echo "$(date '+%F %T') recording mic $FMT:$DEV at ${RATE} Hz" ;;
+        system) echo "$(date '+%F %T') recording system audio $FMT:$SYSDEV at ${RATE} Hz" ;;
+        both) echo "$(date '+%F %T') recording mic $FMT:$DEV (L) + system $FMT:$SYSDEV (R) at ${RATE} Hz" ;;
+    esac
     while [ "$stopping" -eq 0 ]; do
         day="$DIR/$(date +%F)"
         mkdir -p "$day" || die "cannot create $day"
-        left=$(secs_to_midnight)
-        ffmpeg -nostdin -hide_banner -loglevel error \
-            -f "$FMT" -i "$DEV" \
-            -t "$left" -ac "$CHANNELS" -ar "$RATE" -c:a pcm_s16le \
-            -f segment -segment_time "$CHUNK" -segment_atclocktime 1 \
-            -reset_timestamps 1 -strftime 1 -segment_format wav \
-            "$day/%H-%M-%S.wav" &
+        run_ffmpeg "$(secs_to_midnight)" "$day/%H-%M-%S.wav" &
         child=$!
         wait "$child"; rc=$?
         # wait returns early when a signal arrives; wait again so the WAV headers get written.
@@ -102,17 +143,63 @@ record_loop() {
     echo "$(date '+%F %T') stopped"
 }
 
+# Transcribe one WAV with whisper.cpp. Stereo (SOURCE=both) files are split and each
+# side transcribed on its own, then merged by time and labelled Me / Them.
+transcribe_file() {
+    wav=$1
+    txt=${wav%.wav}.txt
+    [ -s "$txt" ] && { echo "skip (done): $txt"; return 0; }
+    tmp=$(mktemp -d) || die "mktemp failed"
+    ch=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$wav")
+    echo "transcribing $wav"
+    if [ "$ch" = 2 ]; then
+        ffmpeg -nostdin -v error -i "$wav" -ar 16000 \
+            -filter_complex "[0:a]channelsplit=channel_layout=stereo[l][r]" \
+            -map "[l]" "$tmp/me.wav" -map "[r]" "$tmp/them.wav" || die "split failed"
+        for side in me them; do
+            "$WHISPER" -m "$MODEL" -l "$LANG_" -f "$tmp/$side.wav" -ocsv -of "$tmp/$side" -np >/dev/null 2>&1 \
+                || die "whisper-cli failed on $wav ($side)"
+        done
+        # CSV rows are start_ms,end_ms,"text". Tag each with a speaker, sort by start.
+        {
+            tail -n +2 "$tmp/me.csv"   | sed 's/^/Me\t/'
+            tail -n +2 "$tmp/them.csv" | sed 's/^/Them\t/'
+        } | awk -F'\t' '{ split($2, f, ","); print f[1] "\t" $1 "\t" $2 }' \
+          | sort -n -k1,1 \
+          | awk -F'\t' '{
+                ms = $1; who = $2
+                sub(/^[0-9]*,[0-9]*,/, "", $3); t = $3
+                gsub(/^"|"$/, "", t); gsub(/""/, "\"", t); sub(/^ +/, "", t)
+                if (t == "") next
+                printf "[%02d:%02d:%02d] %s: %s\n", ms/3600000, (ms/60000)%60, (ms/1000)%60, who, t
+            }' >"$txt"
+    else
+        ffmpeg -nostdin -v error -i "$wav" -ar 16000 -ac 1 "$tmp/a.wav" || die "resample failed"
+        "$WHISPER" -m "$MODEL" -l "$LANG_" -f "$tmp/a.wav" -ocsv -of "$tmp/a" -np >/dev/null 2>&1 \
+            || die "whisper-cli failed on $wav"
+        tail -n +2 "$tmp/a.csv" | awk -F, '{
+                ms = $1; t = $0; sub(/^[0-9]*,[0-9]*,/, "", t)
+                gsub(/^"|"$/, "", t); gsub(/""/, "\"", t); sub(/^ +/, "", t)
+                if (t == "") next
+                printf "[%02d:%02d:%02d] %s\n", ms/3600000, (ms/60000)%60, (ms/1000)%60, t
+            }' >"$txt"
+    fi
+    rm -rf "$tmp"
+    echo "wrote $txt"
+}
+
 cmd=${1:-status}
 case $cmd in
     start)
         is_running && { echo "already recording (pid $(cat "$PIDFILE"))"; exit 0; }
         mkdir -p "$DIR" || die "cannot create $DIR"
+        detect_input   # fail fast on a bad source/device combination
         # nice keeps it out of the way; it spends nearly all its time blocked on the mic anyway.
         nohup nice -n 10 "$0" run >>"$LOGFILE" 2>&1 </dev/null &
         echo $! >"$PIDFILE"
         sleep 1
         is_running || { rm -f "$PIDFILE"; die "failed to start, see $LOGFILE"; }
-        echo "recording to $DIR (pid $(cat "$PIDFILE"))"
+        echo "recording ($SOURCE) to $DIR (pid $(cat "$PIDFILE"))"
         ;;
     stop)
         is_running || { rm -f "$PIDFILE"; echo "not recording"; exit 0; }
@@ -126,7 +213,7 @@ case $cmd in
     status)
         if is_running; then
             echo "recording (pid $(cat "$PIDFILE")) to $DIR"
-            latest=$(ls -1 "$DIR/$(date +%F)" 2>/dev/null | tail -n 1)
+            latest=$(ls -1 "$DIR/$(date +%F)" 2>/dev/null | grep '\.wav$' | tail -n 1)
             [ -n "$latest" ] && echo "current file: $DIR/$(date +%F)/$latest"
         else
             echo "not recording"
@@ -138,13 +225,35 @@ case $cmd in
         record_loop
         ;;
     devices)
-        detect_input
-        case $FMT in
-            pulse) pactl list short sources ;;
+        detect_input 2>/dev/null || true
+        case ${FMT:-} in
+            pulse)
+                echo "# microphones and monitors (monitor = what plays on that output)"
+                pactl list short sources ;;
             alsa) arecord -L 2>/dev/null || cat /proc/asound/pcm ;;
             avfoundation) ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 | grep -i -A20 audio ;;
-            *) echo "no device listing for $FMT" ;;
+            *) echo "no device listing for ${FMT:-unknown}" ;;
         esac
+        ;;
+    transcribe)
+        WHISPER=$(command -v whisper-cli || command -v whisper-cpp || true)
+        [ -n "$WHISPER" ] || die "whisper-cli not found; install whisper.cpp (brew install whisper-cpp, or build from source)"
+        [ -f "$MODEL" ] || die "model not found: $MODEL (download a ggml model, or set DAYREC_WHISPER_MODEL)"
+        target=${2:-"$DIR/$(date +%F)"}
+        if [ -d "$target" ]; then
+            for f in "$target"/*.wav; do
+                [ -f "$f" ] || { echo "no WAV files in $target"; break; }
+                # Skip the file currently being written.
+                if is_running && [ "$f" = "$DIR/$(date +%F)/$(ls -1 "$DIR/$(date +%F)" | grep '\.wav$' | tail -n 1)" ]; then
+                    echo "skip (still recording): $f"; continue
+                fi
+                transcribe_file "$f"
+            done
+        elif [ -f "$target" ]; then
+            transcribe_file "$target"
+        else
+            die "no such file or folder: $target"
+        fi
         ;;
     prune)
         [ -d "$DIR" ] || exit 0
@@ -152,7 +261,7 @@ case $cmd in
             -exec rm -rf {} + -print
         ;;
     -h|--help|help)
-        sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
         ;;
     *)
         die "unknown command: $cmd (try: dayrec help)"
