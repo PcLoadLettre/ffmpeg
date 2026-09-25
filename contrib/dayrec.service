@@ -1,0 +1,14 @@
+# systemd user service: records whenever you are logged in.
+#   cp dayrec ~/.local/bin/ && cp contrib/dayrec.service ~/.config/systemd/user/
+#   systemctl --user enable --now dayrec
+[Unit]
+Description=dayrec background audio recorder
+After=pipewire-pulse.service pulseaudio.service
+
+[Service]
+ExecStart=%h/.local/bin/dayrec run
+Nice=10
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

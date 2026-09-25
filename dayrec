@@ -1,0 +1,160 @@
+#!/bin/sh
+# dayrec: record audio in the background, all day, to plain WAV files.
+#
+#   dayrec start      start recording in the background
+#   dayrec stop       stop recording (files are finalized cleanly)
+#   dayrec status     show whether it is running and where files go
+#   dayrec run        record in the foreground (for systemd, launchd, cron)
+#   dayrec devices    list audio input devices
+#   dayrec prune      delete day folders older than DAYREC_KEEP_DAYS
+#
+# Files land in one folder per day, one WAV per chunk:
+#   ~/Recordings/dayrec/2026-09-25/14-00-00.wav
+#
+# Settings (environment variables, all optional):
+#   DAYREC_DIR        output folder            (default ~/Recordings/dayrec)
+#   DAYREC_RATE       sample rate in Hz        (default 16000)
+#   DAYREC_CHANNELS   1 = mono, 2 = stereo     (default 1)
+#   DAYREC_CHUNK      seconds per WAV file     (default 3600)
+#   DAYREC_DEVICE     input device             (default: system default mic)
+#   DAYREC_FORMAT     ffmpeg input format      (default: auto; pulse, alsa or avfoundation)
+#   DAYREC_KEEP_DAYS  days kept by "prune"     (default 30)
+#
+# Needs only ffmpeg. 16 kHz mono 16-bit is about 115 MB per hour, 2.7 GB per day.
+
+set -u
+
+DIR=${DAYREC_DIR:-"$HOME/Recordings/dayrec"}
+RATE=${DAYREC_RATE:-16000}
+CHANNELS=${DAYREC_CHANNELS:-1}
+CHUNK=${DAYREC_CHUNK:-3600}
+KEEP_DAYS=${DAYREC_KEEP_DAYS:-30}
+PIDFILE="$DIR/.dayrec.pid"
+LOGFILE="$DIR/.dayrec.log"
+
+die() { echo "dayrec: $*" >&2; exit 1; }
+
+command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg not found in PATH"
+
+detect_input() {
+    FMT=${DAYREC_FORMAT:-}
+    DEV=${DAYREC_DEVICE:-}
+    if [ -z "$FMT" ]; then
+        case $(uname -s) in
+            Darwin) FMT=avfoundation ;;
+            *)
+                # PulseAudio, or PipeWire with its pulse shim, is the usual desktop case.
+                if command -v pactl >/dev/null 2>&1 && pactl info >/dev/null 2>&1; then
+                    FMT=pulse
+                else
+                    FMT=alsa
+                fi ;;
+        esac
+    fi
+    if [ -z "$DEV" ]; then
+        case $FMT in
+            avfoundation) DEV=":default" ;;
+            *) DEV=default ;;
+        esac
+    fi
+}
+
+is_running() {
+    [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+# Seconds left until local midnight, so each day gets its own folder.
+secs_to_midnight() {
+    set -- $(date '+%H %M %S')
+    h=${1#0}; m=${2#0}; s=${3#0}
+    echo $((86400 - h * 3600 - m * 60 - s))
+}
+
+record_loop() {
+    detect_input
+    child=
+    trap 'stopping=1; [ -n "$child" ] && kill -TERM "$child" 2>/dev/null' INT TERM
+    stopping=0
+    echo "$(date '+%F %T') recording from $FMT:$DEV at ${RATE} Hz x$CHANNELS"
+    while [ "$stopping" -eq 0 ]; do
+        day="$DIR/$(date +%F)"
+        mkdir -p "$day" || die "cannot create $day"
+        left=$(secs_to_midnight)
+        ffmpeg -nostdin -hide_banner -loglevel error \
+            -f "$FMT" -i "$DEV" \
+            -t "$left" -ac "$CHANNELS" -ar "$RATE" -c:a pcm_s16le \
+            -f segment -segment_time "$CHUNK" -segment_atclocktime 1 \
+            -reset_timestamps 1 -strftime 1 -segment_format wav \
+            "$day/%H-%M-%S.wav" &
+        child=$!
+        wait "$child"; rc=$?
+        # wait returns early when a signal arrives; wait again so the WAV headers get written.
+        wait "$child" 2>/dev/null
+        child=
+        [ "$stopping" -eq 1 ] && break
+        if [ "$rc" -ne 0 ]; then
+            # Device vanished or busy: back off and retry instead of dying.
+            echo "$(date '+%F %T') ffmpeg exited ($rc), retrying in 10s"
+            sleep 10 &
+            wait $! 2>/dev/null
+        fi
+    done
+    echo "$(date '+%F %T') stopped"
+}
+
+cmd=${1:-status}
+case $cmd in
+    start)
+        is_running && { echo "already recording (pid $(cat "$PIDFILE"))"; exit 0; }
+        mkdir -p "$DIR" || die "cannot create $DIR"
+        # nice keeps it out of the way; it spends nearly all its time blocked on the mic anyway.
+        nohup nice -n 10 "$0" run >>"$LOGFILE" 2>&1 </dev/null &
+        echo $! >"$PIDFILE"
+        sleep 1
+        is_running || { rm -f "$PIDFILE"; die "failed to start, see $LOGFILE"; }
+        echo "recording to $DIR (pid $(cat "$PIDFILE"))"
+        ;;
+    stop)
+        is_running || { rm -f "$PIDFILE"; echo "not recording"; exit 0; }
+        pid=$(cat "$PIDFILE")
+        kill -TERM "$pid"
+        i=0
+        while kill -0 "$pid" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
+        rm -f "$PIDFILE"
+        echo "stopped"
+        ;;
+    status)
+        if is_running; then
+            echo "recording (pid $(cat "$PIDFILE")) to $DIR"
+            latest=$(ls -1 "$DIR/$(date +%F)" 2>/dev/null | tail -n 1)
+            [ -n "$latest" ] && echo "current file: $DIR/$(date +%F)/$latest"
+        else
+            echo "not recording"
+        fi
+        du -sh "$DIR" 2>/dev/null | awk '{print "disk used: " $1}'
+        ;;
+    run)
+        mkdir -p "$DIR" || die "cannot create $DIR"
+        record_loop
+        ;;
+    devices)
+        detect_input
+        case $FMT in
+            pulse) pactl list short sources ;;
+            alsa) arecord -L 2>/dev/null || cat /proc/asound/pcm ;;
+            avfoundation) ffmpeg -hide_banner -f avfoundation -list_devices true -i "" 2>&1 | grep -i -A20 audio ;;
+            *) echo "no device listing for $FMT" ;;
+        esac
+        ;;
+    prune)
+        [ -d "$DIR" ] || exit 0
+        find "$DIR" -mindepth 1 -maxdepth 1 -type d -name '????-??-??' -mtime +"$KEEP_DAYS" \
+            -exec rm -rf {} + -print
+        ;;
+    -h|--help|help)
+        sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+    *)
+        die "unknown command: $cmd (try: dayrec help)"
+        ;;
+esac
